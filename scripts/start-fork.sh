@@ -8,7 +8,10 @@ set -a
 source .env
 set +a
 
-: "${FORK_RPC_URL:?FORK_RPC_URL is not set in .env}"
+# Fork source: FORK_RPC_URL if set, otherwise a free public mainnet RPC (fine for quick runs; a keyed RPC is
+# more reliable for long sessions and needed to pin an old FORK_BLOCK_NUMBER).
+DEFAULT_FORK_RPC_URL="https://ethereum-rpc.publicnode.com"
+FORK_RPC_URL="${FORK_RPC_URL:-$DEFAULT_FORK_RPC_URL}"
 # Port from RPC_URL (e.g. http://127.0.0.1:8545/), falling back to Anvil's default.
 PORT="$(printf '%s' "${RPC_URL:-}" | sed -nE 's#^[a-zA-Z]+://[^/]*:([0-9]+)([/?].*)?$#\1#p')"
 PORT="${PORT:-8545}"
