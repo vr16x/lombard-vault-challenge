@@ -1,10 +1,11 @@
 import "dotenv/config";
 import { parseUnits } from "ethers";
+import { advanceTimeTo, withImpersonation } from "./common/helpers/anvil";
 import { exitWithError } from "./common/helpers/errors";
-import { formatTokenAmount, formatUsd } from "./common/helpers/formatters";
+import { formatDuration, formatTokenAmount, formatUsd } from "./common/helpers/formatters";
 import { assertLocalFork, getSigner } from "./common/helpers/signer";
 import type { Address } from "./common/types/web3-primitives";
-import { LBTCV_YIELD_VAULT_ID } from "./config/opportunities";
+import { getOpportunity, LBTCV_YIELD_VAULT_ID } from "./config/opportunities";
 import { getVault } from "./modules/vaults";
 
 /** In deposit-token units (LBTC). */
@@ -37,11 +38,26 @@ async function main(): Promise<void> {
 
   console.log();
   console.log(`Wallet: ${wallet}`);
-  console.log(`Balance before: ${formatShares(await vault.getShareBalance(wallet))}`);
+  console.log(`Balance before (${shareToken.symbol}): ${formatShares(await vault.getShareBalance(wallet))}`);
 
   console.log("Depositing...");
   await vault.deposit(signer, parseUnits(DEPOSIT_AMOUNT, depositToken.decimals));
-  console.log(`Balance after: ${formatShares(await vault.getShareBalance(wallet))}`);
+  const sharesAfterDeposit = await vault.getShareBalance(wallet);
+  console.log(`Balance after (${shareToken.symbol}): ${formatShares(sharesAfterDeposit)}`);
+
+  console.log("Withdrawing...");
+  const request = await vault.requestWithdraw(signer, sharesAfterDeposit);
+  console.log(`  - Withdraw request queued, matures in ${formatDuration(request.secondsToMaturity)}`);
+
+  // Fork only: the queue pays out after maturity, and only Lombard's keeper may trigger the solver,
+  // so skip ahead past maturity and act as the keeper.
+  const advancedSeconds = await advanceTimeTo(request.creationTime + request.secondsToMaturity);
+  console.log(`  - [anvil] Advanced time by ${formatDuration(advancedSeconds)}`);
+  console.log("  - Keeper solver solving...");
+  await withImpersonation(getOpportunity(LBTCV_YIELD_VAULT_ID).solverKeeper, (keeper) => vault.solveWithdraws(keeper, [request]));
+
+  console.log(`Balance final (${shareToken.symbol}): ${formatShares(await vault.getShareBalance(wallet))}`);
+  console.log("✅ Complete!");
 }
 
 main().catch(exitWithError);
