@@ -1,8 +1,10 @@
-import { Contract, type Provider } from "ethers";
+import { Contract, formatUnits, type Provider, type Signer } from "ethers";
 import { ACCOUNTANT_ABI, QUEUE_ABI, TELLER_ABI } from "../../common/abis/boring-vault";
 import { ERC20_ABI } from "../../common/abis/erc20";
 import { apiGet } from "../../common/helpers/api-call";
 import { formatUtcDate } from "../../common/helpers/formatters";
+import { waitForSuccess } from "../../common/helpers/transaction";
+import type { Address } from "../../common/types/web3-primitives";
 import type { Opportunity } from "../../config/opportunities";
 import type { ApyWindowDays, TokenInfo, VaultMetadata, VaultStatus, YieldVault } from "./interfaces/vault.interface";
 
@@ -18,6 +20,9 @@ const SECONDS_PER_DAY = 86_400;
 const DAYS_PER_YEAR = 365;
 /** Snapshots are taken daily at 00:00 UTC, so anything older than this means the API stopped updating. */
 const MAX_SNAPSHOT_AGE_SECONDS = 2 * SECONDS_PER_DAY;
+const BPS = 10_000n;
+/** Matches the Accountant's maximum upward rate change per update (allowedExchangeRateChangeUpper = 1.005). */
+const MIN_MINT_SLIPPAGE_BPS = 50n;
 
 export class LbtcvYieldVault implements YieldVault {
   constructor(
@@ -27,7 +32,11 @@ export class LbtcvYieldVault implements YieldVault {
 
   /** APY and TVL come from one vault history fetch, run alongside the on-chain token reads. */
   async getVaultMetadata(signal?: AbortSignal): Promise<VaultMetadata> {
-    const [snapshots, depositToken] = await Promise.all([this.fetchDailySnapshots(signal), this.getDepositToken()]);
+    const [snapshots, depositToken, shareToken] = await Promise.all([
+      this.fetchDailySnapshots(signal),
+      this.getTokenInfo(this.opportunity.depositToken),
+      this.getTokenInfo(this.opportunity.vault),
+    ]);
     const latest = snapshots[0];
     const { name, vault } = this.opportunity;
     if (!latest) throw new Error(`No history found for ${name} (${vault}), so APY and TVL are unavailable`);
@@ -43,6 +52,7 @@ export class LbtcvYieldVault implements YieldVault {
       apy: { 7: computeApy(snapshots, 7), 30: computeApy(snapshots, 30) },
       tvlUsd: requireTvlUsd(latest),
       depositToken,
+      shareToken,
     };
   }
 
@@ -75,8 +85,51 @@ export class LbtcvYieldVault implements YieldVault {
     return { ...status, warnings };
   }
 
-  private async getDepositToken(): Promise<TokenInfo> {
-    const token = new Contract(this.opportunity.depositToken, ERC20_ABI, this.provider);
+  async getShareBalance(owner: Address): Promise<bigint> {
+    return new Contract(this.opportunity.vault, ERC20_ABI, this.provider).balanceOf(owner);
+  }
+
+  /**
+   * Deposits through the Teller. The vault (not the Teller) pulls the tokens, so it is the approved spender.
+   * minimumMint allows for one maximum-size rate update landing between the preview and the deposit.
+   */
+  async deposit(signer: Signer, amount: bigint): Promise<string> {
+    if (amount <= 0n) throw new Error("Deposit amount must be greater than zero");
+
+    const { vault, teller, accountant, depositToken } = this.opportunity;
+    const owner = await signer.getAddress();
+    const token = new Contract(depositToken, ERC20_ABI, signer);
+    const tellerContract = new Contract(teller, TELLER_ABI, signer);
+
+    const [balance, allowance, { symbol, decimals }, rateInQuote, assetData, shareDecimals] = await Promise.all([
+      token.balanceOf(owner) as Promise<bigint>,
+      token.allowance(owner, vault) as Promise<bigint>,
+      this.getTokenInfo(depositToken),
+      new Contract(accountant, ACCOUNTANT_ABI, this.provider).getRateInQuoteSafe(depositToken) as Promise<bigint>,
+      tellerContract.assetData(depositToken),
+      new Contract(vault, ERC20_ABI, this.provider).decimals(),
+    ]);
+    if (balance < amount) {
+      throw new Error(`Insufficient ${symbol}: ${owner} holds ${formatUnits(balance, decimals)}, deposit needs ${formatUnits(amount, decimals)}`);
+    }
+
+    if (allowance < amount) {
+      await waitForSuccess(await token.approve(vault, amount), `${symbol} approval`);
+    }
+
+    // Same maths and rounding as the Teller: shares = amount * ONE_SHARE / rateInQuote, then less the share premium.
+    const oneShare = 10n ** BigInt(shareDecimals);
+    const sharePremiumBps = BigInt(assetData.sharePremium);
+    const expectedShares = (((amount * oneShare) / rateInQuote) * (BPS - sharePremiumBps)) / BPS;
+    const minimumMint = (expectedShares * (BPS - MIN_MINT_SLIPPAGE_BPS)) / BPS;
+    if (minimumMint === 0n) throw new Error(`Deposit of ${formatUnits(amount, decimals)} ${symbol} is too small to mint any shares`);
+
+    const receipt = await waitForSuccess(await tellerContract.deposit(depositToken, amount, minimumMint), "Deposit");
+    return receipt.hash;
+  }
+
+  private async getTokenInfo(address: Address): Promise<TokenInfo> {
+    const token = new Contract(address, ERC20_ABI, this.provider);
     const [symbol, decimals] = await Promise.all([token.symbol(), token.decimals()]);
     return { symbol, decimals: Number(decimals) };
   }
