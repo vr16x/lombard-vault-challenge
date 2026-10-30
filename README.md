@@ -155,3 +155,6 @@ src/
   scripts/
     fund-wallet.ts              # npm run fund: sends LBTC to the test wallet on the fork
 ```
+
+> [!WARNING]
+> **Note for the challenge authors:** the Veda DeFi vault docs link on the challenge's Notion page appears to be invalid or expired. I used other relevant Veda and Lombard documentation to implement the yield flow instead. Mentioning it so the link can be fixed in the challenge.
