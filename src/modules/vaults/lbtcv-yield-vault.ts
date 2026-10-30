@@ -1,12 +1,12 @@
-import { Contract, formatUnits, type Provider, type Signer } from "ethers";
-import { ACCOUNTANT_ABI, QUEUE_ABI, TELLER_ABI } from "../../common/abis/boring-vault";
+import { Contract, formatUnits, Interface, type Provider, type Signer } from "ethers";
+import { ACCOUNTANT_ABI, QUEUE_ABI, SOLVER_ABI, TELLER_ABI } from "../../common/abis/boring-vault";
 import { ERC20_ABI } from "../../common/abis/erc20";
 import { apiGet } from "../../common/helpers/api-call";
 import { formatUtcDate } from "../../common/helpers/formatters";
 import { waitForSuccess } from "../../common/helpers/transaction";
 import type { Address } from "../../common/types/web3-primitives";
 import type { Opportunity } from "../../config/opportunities";
-import type { ApyWindowDays, TokenInfo, VaultMetadata, VaultStatus, YieldVault } from "./interfaces/vault.interface";
+import type { ApyWindowDays, TokenInfo, VaultMetadata, VaultStatus, WithdrawRequest, YieldVault } from "./interfaces/vault.interface";
 
 /** One validated entry of Lombard's vault history API; only the fields we use. */
 interface DailySnapshot {
@@ -59,12 +59,13 @@ export class LbtcvYieldVault implements YieldVault {
   /** On-chain checks for anything that would make a deposit or withdrawal revert. */
   async getVaultStatus(): Promise<VaultStatus> {
     const { teller, accountant, queue, depositToken, withdrawToken } = this.opportunity;
-    const [tellerPaused, accountantState, queuePaused, depositAssetData, withdrawAssetData] = await Promise.all([
+    const [tellerPaused, accountantState, queuePaused, depositAssetData, withdrawAssetData, shareLockPeriod] = await Promise.all([
       new Contract(teller, TELLER_ABI, this.provider).isPaused(),
       new Contract(accountant, ACCOUNTANT_ABI, this.provider).accountantState(),
       new Contract(queue, QUEUE_ABI, this.provider).isPaused(),
       new Contract(teller, TELLER_ABI, this.provider).assetData(depositToken),
       new Contract(queue, QUEUE_ABI, this.provider).withdrawAssets(withdrawToken),
+      new Contract(teller, TELLER_ABI, this.provider).shareLockPeriod(),
     ]);
 
     const status = {
@@ -73,6 +74,7 @@ export class LbtcvYieldVault implements YieldVault {
       queuePaused: Boolean(queuePaused),
       depositsAllowed: Boolean(depositAssetData.allowDeposits),
       withdrawalsAllowed: Boolean(withdrawAssetData.allowWithdraws),
+      shareLockPeriodSeconds: Number(shareLockPeriod),
     };
 
     const warnings: string[] = [];
@@ -81,6 +83,9 @@ export class LbtcvYieldVault implements YieldVault {
     if (status.queuePaused) warnings.push("Withdraw queue is paused: withdrawals are disabled");
     if (!status.depositsAllowed) warnings.push("Teller does not accept deposits of the deposit token");
     if (!status.withdrawalsAllowed) warnings.push("Withdraw queue does not pay out the withdraw token");
+    if (status.shareLockPeriodSeconds > 0) {
+      warnings.push(`Teller locks new shares for ${status.shareLockPeriodSeconds}s: a withdrawal right after the deposit would revert`);
+    }
 
     return { ...status, warnings };
   }
@@ -125,6 +130,56 @@ export class LbtcvYieldVault implements YieldVault {
     if (minimumMint === 0n) throw new Error(`Deposit of ${formatUnits(amount, decimals)} ${symbol} is too small to mint any shares`);
 
     const receipt = await waitForSuccess(await tellerContract.deposit(depositToken, amount, minimumMint), "Deposit");
+    return receipt.hash;
+  }
+
+  /**
+   * Queues `shares` for withdrawal at the queue's best terms for the user: the minimum discount and the
+   * shortest allowed deadline. The queue takes the shares now and fixes the payout; a solver pays it after maturity.
+   */
+  async requestWithdraw(signer: Signer, shares: bigint): Promise<WithdrawRequest> {
+    if (shares <= 0n) throw new Error("Withdraw amount must be greater than zero");
+
+    const { vault, queue, withdrawToken } = this.opportunity;
+    const owner = await signer.getAddress();
+    const shareToken = new Contract(vault, ERC20_ABI, signer);
+    const queueContract = new Contract(queue, QUEUE_ABI, signer);
+
+    const [balance, allowance, rules, { symbol, decimals }] = await Promise.all([
+      shareToken.balanceOf(owner) as Promise<bigint>,
+      shareToken.allowance(owner, queue) as Promise<bigint>,
+      queueContract.withdrawAssets(withdrawToken),
+      this.getTokenInfo(vault),
+    ]);
+    if (!rules.allowWithdraws) throw new Error("Withdraw queue does not pay out the withdraw token");
+    if (balance < shares) {
+      throw new Error(`Insufficient ${symbol}: ${owner} holds ${formatUnits(balance, decimals)}, withdrawal needs ${formatUnits(shares, decimals)}`);
+    }
+    if (shares < rules.minimumShares) {
+      throw new Error(`Withdrawal of ${formatUnits(shares, decimals)} ${symbol} is below the queue minimum of ${formatUnits(rules.minimumShares, decimals)}`);
+    }
+
+    // The queue pulls the shares, so it is the approved spender.
+    if (allowance < shares) {
+      await waitForSuccess(await shareToken.approve(queue, shares), "Share approval");
+    }
+
+    const tx = await queueContract.requestOnChainWithdraw(withdrawToken, shares, rules.minDiscount, rules.minimumSecondsToDeadline);
+    const receipt = await waitForSuccess(tx, "Withdraw request");
+    return parseWithdrawRequest(receipt.logs, queue);
+  }
+
+  /**
+   * Pays out matured requests through the vault's BoringSolver, which redeems their shares at the Teller and
+   * forwards each user's fixed payout. coverDeficit is off: the keeper does not top up a shortfall.
+   */
+  async solveWithdraws(keeper: Signer, requests: WithdrawRequest[]): Promise<string> {
+    if (requests.length === 0) throw new Error("No withdraw requests to solve");
+
+    const { solver, teller } = this.opportunity;
+    const structs = requests.map(({ id: _id, ...request }) => request);
+    const tx = await new Contract(solver, SOLVER_ABI, keeper).boringRedeemSolve(structs, teller, false);
+    const receipt = await waitForSuccess(tx, "Withdraw solve");
     return receipt.hash;
   }
 
@@ -182,4 +237,29 @@ function computeApy(snapshots: DailySnapshot[], windowDays: ApyWindowDays): numb
 
   const days = (latest.unixSeconds - start.unixSeconds) / SECONDS_PER_DAY;
   return ((requireSharePrice(latest) / requireSharePrice(start)) ** (DAYS_PER_YEAR / days) - 1) * 100;
+}
+
+const QUEUE_INTERFACE = new Interface(QUEUE_ABI);
+
+/** Reads the request back from its OnChainWithdrawRequested event; the queue only stores its hash. */
+function parseWithdrawRequest(logs: readonly { address: string; topics: readonly string[]; data: string }[], queue: Address): WithdrawRequest {
+  for (const log of logs) {
+    if (log.address.toLowerCase() !== queue.toLowerCase()) continue;
+    const event = QUEUE_INTERFACE.parseLog(log);
+    if (event?.name !== "OnChainWithdrawRequested") continue;
+
+    const { requestId, user, assetOut, nonce, amountOfShares, amountOfAssets, creationTime, secondsToMaturity, secondsToDeadline } = event.args;
+    return {
+      id: requestId,
+      nonce,
+      user,
+      assetOut,
+      amountOfShares,
+      amountOfAssets,
+      creationTime: Number(creationTime),
+      secondsToMaturity: Number(secondsToMaturity),
+      secondsToDeadline: Number(secondsToDeadline),
+    };
+  }
+  throw new Error("Withdraw request was mined but no OnChainWithdrawRequested event was found");
 }
