@@ -5,6 +5,8 @@
   "main": "dist/main.js",
   "scripts": {
     "start": "ts-node src/main.ts",
+    "fork": "bash scripts/start-fork.sh",
+    "fund": "ts-node src/scripts/fund-wallet.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
   },
