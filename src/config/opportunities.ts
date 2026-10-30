@@ -14,9 +14,11 @@ export interface Opportunity {
   baseAsset: Address;
 }
 
+export const LBTCV_YIELD_VAULT_ID = "lbtcv-yield-vault";
+
 export const opportunities: Opportunity[] = [
   {
-    id: "lbtcv-yield-vault",
+    id: LBTCV_YIELD_VAULT_ID,
     name: "Lombard DeFi Vault",
     chainId: 1,
     vault: "0x5401b8620E5FB570064CA9114fd1e135fd77D57c",
@@ -29,3 +31,9 @@ export const opportunities: Opportunity[] = [
     baseAsset: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
   },
 ];
+
+export function getOpportunity(id: string): Opportunity {
+  const opportunity = opportunities.find((o) => o.id === id);
+  if (!opportunity) throw new Error(`No opportunity configured with id "${id}"`);
+  return opportunity;
+}

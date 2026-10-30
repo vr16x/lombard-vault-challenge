@@ -1,19 +1,11 @@
 import { getProvider } from "../../common/helpers/provider";
-import { opportunities, type Opportunity } from "../../config/opportunities";
+import { getOpportunity, LBTCV_YIELD_VAULT_ID } from "../../config/opportunities";
 import type { YieldVault } from "./interfaces/vault.interface";
 import { LbtcvYieldVault } from "./lbtcv-yield-vault";
 
-function opportunityById(id: string): Opportunity {
-  const opportunity = opportunities.find((o) => o.id === id);
-  if (!opportunity) throw new Error(`No opportunity configured with id "${id}"`);
-  return opportunity;
-}
-
-const LBTCV_YIELD_VAULT_ID = "lbtcv-yield-vault";
-
 /** Vault factories keyed by opportunity id; nothing is built until first requested. */
 const vaultFactories = new Map<string, () => YieldVault>([
-  [LBTCV_YIELD_VAULT_ID, () => new LbtcvYieldVault(opportunityById(LBTCV_YIELD_VAULT_ID), getProvider())],
+  [LBTCV_YIELD_VAULT_ID, () => new LbtcvYieldVault(getOpportunity(LBTCV_YIELD_VAULT_ID), getProvider())],
 ]);
 
 const vaults = new Map<string, YieldVault>();
